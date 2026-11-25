@@ -59,7 +59,7 @@ jobs:
               return;
             }
 
-            const octokit = github.getOctokit(token);
+            const api = github.getOctokit(token);
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             const DAY = 86400000;
             const HOUR = 3600000;
@@ -104,13 +104,13 @@ jobs:
                 }
                 let list = [];
                 try {
-                  const { data: who } = await octokit.rest.users.getByUsername({ username: owner });
+                  const { data: who } = await api.rest.users.getByUsername({ username: owner });
                   if (who.type === 'Organization') {
-                    list = await collect(octokit.rest.repos.listForOrg, { org: owner, type: 'all' }, 'repos');
+                    list = await collect(api.rest.repos.listForOrg, { org: owner, type: 'all' }, 'repos');
                   } else {
                     // 个人账号：从 token 可见的仓库里筛（token 属于该账号，或其对该账号仓库有协作权限）
                     list = await collect(
-                      octokit.rest.repos.listForAuthenticatedUser,
+                      api.rest.repos.listForAuthenticatedUser,
                       { affiliation: 'owner,collaborator,organization_member' },
                       'repos'
                     );
@@ -162,7 +162,7 @@ jobs:
               let runs = [];
               try {
                 runs = await collect(
-                  octokit.rest.actions.listWorkflowRunsForRepo,
+                  api.rest.actions.listWorkflowRunsForRepo,
                   { owner, repo },
                   'workflow_runs'
                 );
@@ -206,7 +206,7 @@ jobs:
                   continue;
                 }
                 try {
-                  await octokit.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+                  await api.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
                   deletedRunIds.add(run.id);
                   deletedRuns++;
                 } catch (e) {
@@ -223,7 +223,7 @@ jobs:
               let artifacts = [];
               try {
                 artifacts = await collect(
-                  octokit.rest.actions.listArtifactsForRepo,
+                  api.rest.actions.listArtifactsForRepo,
                   { owner, repo },
                   'artifacts'
                 );
@@ -251,7 +251,7 @@ jobs:
                   continue;
                 }
                 try {
-                  await octokit.rest.actions.deleteArtifact({
+                  await api.rest.actions.deleteArtifact({
                     owner,
                     repo,
                     artifact_id: artifact.id,
