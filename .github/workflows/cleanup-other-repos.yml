@@ -52,6 +52,8 @@ jobs:
         env:
           CLEANUP_TOKEN: ${{ secrets.CLEANUP_TOKEN }}
         with:
+          # 用 PAT 作为 github-script 的客户端 token，注入的 github 对象即带 PAT 权限
+          github-token: ${{ secrets.CLEANUP_TOKEN }}
           script: |
             const token = (process.env.CLEANUP_TOKEN || '').trim();
             if (!token) {
@@ -59,7 +61,8 @@ jobs:
               return;
             }
 
-            const api = github.getOctokit(token);
+            // github-script 注入的 github 本身已经是 octokit 实例（已用 github-token 认证）
+            const api = github;
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             const DAY = 86400000;
             const HOUR = 3600000;
