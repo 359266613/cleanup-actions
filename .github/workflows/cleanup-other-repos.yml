@@ -1,0 +1,292 @@
+name: Cleanup other repos (runs & artifacts)
+
+# 用途：清理其它仓库（含私有仓库）的 Actions 运行记录与 artifact，释放 artifact 存储配额。
+# 用法：在任意一个有该 workflow 的仓库里手动 Run workflow，填目标仓库列表。
+# 需要 Secret: CLEANUP_TOKEN —— 有权限删除目标仓库 Actions 记录的 PAT：
+#   - classic PAT：勾选 repo（私有仓库必须，含 Actions 读写）
+#   - fine-grained PAT：目标仓库 + Actions: Read and write + Metadata: Read
+# 若不想用 PAT，也可以把这个文件复制到目标仓库里，把 env 改成 ${{ secrets.GITHUB_TOKEN }}，
+# 并把 repos 填成当前仓库。
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: '目标仓库，owner/repo 列表，逗号或空格分隔；写 owner/* 表示该账号或组织下所有仓库'
+        required: true
+        type: string
+      keep_runs:
+        description: '每个仓库、每个工作流保留最新几条运行记录'
+        required: false
+        default: '3'
+        type: string
+      run_max_age_days:
+        description: '删除创建超过 N 天的运行记录（0 = 只按条数保留）'
+        required: false
+        default: '30'
+        type: string
+      artifact_max_age_hours:
+        description: '删除创建超过 N 小时的产物（即使其运行记录被保留；0 = 保留运行记录内的产物）'
+        required: false
+        default: '24'
+        type: string
+      dry_run:
+        description: '仅预览不删除（先跑一次确认清单）'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup-other-repos
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup runs and artifacts
+        uses: actions/github-script@v7
+        env:
+          CLEANUP_TOKEN: ${{ secrets.CLEANUP_TOKEN }}
+        with:
+          script: |
+            const token = (process.env.CLEANUP_TOKEN || '').trim();
+            if (!token) {
+              core.setFailed('缺少 CLEANUP_TOKEN secret（需要能删除目标仓库 Actions 记录的 PAT）');
+              return;
+            }
+
+            const octokit = github.getOctokit(token);
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const DAY = 86400000;
+            const HOUR = 3600000;
+
+            const repos = (core.getInput('repos') || '')
+              .split(/[\s,]+/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (repos.length === 0) {
+              core.setFailed('repos 不能为空');
+              return;
+            }
+
+            const keepRuns = Math.max(0, Number.parseInt(core.getInput('keep_runs') || '3', 10) || 0);
+            const runMaxAgeDays = Number.parseFloat(core.getInput('run_max_age_days') || '30') || 0;
+            const artifactMaxAgeHours = Number.parseFloat(core.getInput('artifact_max_age_hours') || '24') || 0;
+            const dryRun = String(core.getInput('dry_run')).toLowerCase() !== 'false';
+
+            core.info(`keep_runs=${keepRuns} run_max_age_days=${runMaxAgeDays} artifact_max_age_hours=${artifactMaxAgeHours} dry_run=${dryRun}`);
+
+            // 通用分页收集
+            async function collect(method, params, key) {
+              const out = [];
+              for (let page = 1; ; page++) {
+                const res = await method({ ...params, per_page: 100, page });
+                const items = Array.isArray(res.data) ? res.data : res.data[key] || [];
+                out.push(...items);
+                if (items.length < 100) break;
+                await sleep(300);
+              }
+              return out;
+            }
+
+            // 展开 owner/* 通配：列出该个人账号或组织下所有仓库（含私有）
+            async function expandTargets(patterns) {
+              const out = [];
+              for (const pattern of patterns) {
+                const [owner, name] = pattern.split('/');
+                if (name !== '*') {
+                  out.push(pattern);
+                  continue;
+                }
+                let list = [];
+                try {
+                  const { data: who } = await octokit.rest.users.getByUsername({ username: owner });
+                  if (who.type === 'Organization') {
+                    list = await collect(octokit.rest.repos.listForOrg, { org: owner, type: 'all' }, 'repos');
+                  } else {
+                    // 个人账号：从 token 可见的仓库里筛（token 属于该账号，或其对该账号仓库有协作权限）
+                    list = await collect(
+                      octokit.rest.repos.listForAuthenticatedUser,
+                      { affiliation: 'owner,collaborator,organization_member' },
+                      'repos'
+                    );
+                  }
+                } catch (e) {
+                  core.error(`枚举 ${owner}/* 失败：${e.status || ''} ${e.message}`);
+                  continue;
+                }
+                const matched = list.filter((r) => r.owner.login.toLowerCase() === owner.toLowerCase());
+                core.info(`${pattern} → 匹配 ${matched.length} 个仓库`);
+                if (matched.length === 0) {
+                  core.warning(
+                    `没找到 ${owner} 的仓库：请确认 CLEANUP_TOKEN 属于 ${owner}（或对其仓库有协作者权限），` +
+                      'classic PAT 需勾 repo，fine-grained 需 Actions: Read and write + Metadata: Read'
+                  );
+                }
+                matched.forEach((r) => out.push(r.full_name));
+              }
+              return [...new Set(out)];
+            }
+
+            const targets = await expandTargets(repos);
+            core.info(`共 ${targets.length} 个目标仓库：${targets.join(', ')}`);
+            if (targets.length === 0) {
+              core.setFailed('没有匹配到任何目标仓库');
+              return;
+            }
+
+            const rows = [
+              [
+                { data: '仓库', header: true },
+                { data: '运行记录', header: true },
+                { data: '删除运行', header: true },
+                { data: '产物', header: true },
+                { data: '删除产物', header: true },
+                { data: '实际释放', header: true },
+              ],
+            ];
+
+            for (const full of targets) {
+              const parts = full.split('/');
+              if (parts.length !== 2 || !parts[0] || !parts[1]) {
+                core.warning(`跳过非法仓库名：${full}`);
+                continue;
+              }
+              const [owner, repo] = parts;
+              core.info(`\n===== ${owner}/${repo} =====`);
+
+              let runs = [];
+              try {
+                runs = await collect(
+                  octokit.rest.actions.listWorkflowRunsForRepo,
+                  { owner, repo },
+                  'workflow_runs'
+                );
+              } catch (e) {
+                core.error(`${full} 列出运行记录失败：${e.status || ''} ${e.message}`);
+                rows.push([full, '-', '-', '-', '-', `失败：${e.status || ''} ${e.message}`]);
+                continue;
+              }
+
+              const now = Date.now();
+
+              // 按工作流分组，各自保留最新 keepRuns 条；再叠加“超龄就删”
+              const byWorkflow = new Map();
+              for (const run of runs) {
+                const key = run.workflow_id ?? 0;
+                if (!byWorkflow.has(key)) byWorkflow.set(key, []);
+                byWorkflow.get(key).push(run);
+              }
+
+              const runsToDelete = [];
+              const keepRunIds = new Set();
+              for (const list of byWorkflow.values()) {
+                list.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+                list.forEach((run, idx) => {
+                  const tooOld =
+                    runMaxAgeDays > 0 && now - Date.parse(run.created_at) > runMaxAgeDays * DAY;
+                  if (idx >= keepRuns || tooOld) runsToDelete.push(run);
+                  else keepRunIds.add(run.id);
+                });
+              }
+
+              const runsToDeleteIds = new Set(runsToDelete.map((r) => r.id));
+              const deletedRunIds = new Set();
+              let deletedRuns = 0;
+              let freedBytes = 0;
+
+              for (const run of runsToDelete) {
+                const label = `run #${run.run_number}（${run.name}，${run.created_at}，${run.event}）`;
+                if (dryRun) {
+                  core.info(`[dry-run] 将删除 ${label}`);
+                  continue;
+                }
+                try {
+                  await octokit.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+                  deletedRunIds.add(run.id);
+                  deletedRuns++;
+                } catch (e) {
+                  if (e.status === 404) {
+                    core.info(`已不存在，跳过 ${label}`);
+                  } else {
+                    core.warning(`删除 ${label} 失败：${e.status || ''} ${e.message}`);
+                  }
+                }
+                await sleep(150);
+              }
+
+              // 产物：属于将被删/已删的 run 会随 run 一起消失，不重复删
+              let artifacts = [];
+              try {
+                artifacts = await collect(
+                  octokit.rest.actions.listArtifactsForRepo,
+                  { owner, repo },
+                  'artifacts'
+                );
+              } catch (e) {
+                core.warning(`${full} 列出产物失败：${e.status || ''} ${e.message}`);
+              }
+
+              const goesWithRun = (runId) =>
+                runId !== undefined && (runsToDeleteIds.has(runId) || deletedRunIds.has(runId));
+
+              const artifactsToDelete = artifacts.filter((a) => {
+                const runId = a.workflow_run ? a.workflow_run.id : undefined;
+                if (goesWithRun(runId)) return false; // run 删掉时会一起清掉
+                if (!runId || !keepRunIds.has(runId)) return true; // 孤儿产物
+                return artifactMaxAgeHours > 0 && now - Date.parse(a.created_at) > artifactMaxAgeHours * HOUR;
+              });
+
+              let deletedArtifacts = 0;
+              for (const artifact of artifactsToDelete) {
+                const size = artifact.size_in_bytes || 0;
+                const label = `artifact "${artifact.name}"（${(size / 1048576).toFixed(2)} MB，${artifact.created_at}）`;
+                if (dryRun) {
+                  core.info(`[dry-run] 将删除 ${label}`);
+                  freedBytes += size;
+                  continue;
+                }
+                try {
+                  await octokit.rest.actions.deleteArtifact({
+                    owner,
+                    repo,
+                    artifact_id: artifact.id,
+                  });
+                  deletedArtifacts++;
+                  freedBytes += size;
+                } catch (e) {
+                  if (e.status !== 404) {
+                    core.warning(`删除 ${label} 失败：${e.status || ''} ${e.message}`);
+                  }
+                }
+                await sleep(150);
+              }
+
+              core.info(
+                `${full}: 运行记录 ${runs.length} 条 → 删 ${dryRun ? `${runsToDelete.length}(预览)` : deletedRuns}；` +
+                  `产物 ${artifacts.length} 个 → 删 ${dryRun ? `${artifactsToDelete.length}(预览)` : deletedArtifacts}`
+              );
+
+              rows.push([
+                full,
+                String(runs.length),
+                dryRun ? `${runsToDelete.length}（预览）` : String(deletedRuns),
+                String(artifacts.length),
+                dryRun ? `${artifactsToDelete.length}（预览）` : String(deletedArtifacts),
+                `${(freedBytes / 1048576).toFixed(2)} MB`,
+              ]);
+            }
+
+            await core.summary
+              .addHeading(`Actions 清理结果${dryRun ? '（dry-run 预览，未删除）' : ''}`)
+              .addTable(rows)
+              .addRaw(
+                dryRun
+                  ? '<p>确认清单无误后，用 <code>dry_run = false</code> 再跑一次。</p>'
+                  : '<p>配额用量由 GitHub 每 6-12 小时重算，页面数字可能不会立刻下降。</p>'
+              )
+              .write();
