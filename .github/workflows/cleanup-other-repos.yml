@@ -205,9 +205,26 @@ jobs:
               }
 
               const runsToDeleteIds = new Set(runsToDelete.map((r) => r.id));
-              const deletedRunIds = new Set();
               let deletedRuns = 0;
               let freedBytes = 0;
+
+              // 产物必须在删 run 之前列出来：run 一删，其 artifact 会一起消失、事后查不到，
+              // 否则“实际释放”会永远显示 0 MB
+              let artifacts = [];
+              try {
+                artifacts = await collect(api.rest.actions.listArtifactsForRepo, { owner, repo }, 'artifacts');
+              } catch (e) {
+                core.warning(`${full} 列出产物失败：${e.status || ''} ${e.message}`);
+              }
+
+              const goesWithRun = (runId) => runId !== undefined && runsToDeleteIds.has(runId);
+              let artifactsWithRun = 0;
+              for (const a of artifacts) {
+                if (goesWithRun(a.workflow_run ? a.workflow_run.id : undefined)) {
+                  artifactsWithRun++;
+                  freedBytes += a.size_in_bytes || 0;
+                }
+              }
 
               for (const run of runsToDelete) {
                 const label = `run #${run.run_number}（${run.name}，${run.created_at}，${run.event}）`;
@@ -217,7 +234,6 @@ jobs:
                 }
                 try {
                   await api.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
-                  deletedRunIds.add(run.id);
                   deletedRuns++;
                 } catch (e) {
                   if (e.status === 404) {
@@ -230,20 +246,6 @@ jobs:
               }
 
               // 产物：属于将被删/已删的 run 会随 run 一起消失，不重复删
-              let artifacts = [];
-              try {
-                artifacts = await collect(
-                  api.rest.actions.listArtifactsForRepo,
-                  { owner, repo },
-                  'artifacts'
-                );
-              } catch (e) {
-                core.warning(`${full} 列出产物失败：${e.status || ''} ${e.message}`);
-              }
-
-              const goesWithRun = (runId) =>
-                runId !== undefined && (runsToDeleteIds.has(runId) || deletedRunIds.has(runId));
-
               const artifactsToDelete = artifacts.filter((a) => {
                 const runId = a.workflow_run ? a.workflow_run.id : undefined;
                 if (goesWithRun(runId)) return false; // run 删掉时会一起清掉
@@ -278,7 +280,8 @@ jobs:
 
               core.info(
                 `${full}: 运行记录 ${runs.length} 条 → 删 ${dryRun ? `${runsToDelete.length}(预览)` : deletedRuns}；` +
-                  `产物 ${artifacts.length} 个 → 删 ${dryRun ? `${artifactsToDelete.length}(预览)` : deletedArtifacts}`
+                  `产物 ${artifacts.length} 个 → 单独删 ${dryRun ? `${artifactsToDelete.length}(预览)` : deletedArtifacts}，` +
+                  `随 run 删除 ${artifactsWithRun}；释放 ${(freedBytes / 1048576).toFixed(2)} MB`
               );
 
               rows.push([
