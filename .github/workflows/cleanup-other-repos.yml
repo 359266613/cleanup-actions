@@ -54,6 +54,13 @@ jobs:
         with:
           # 用 PAT 作为 github-script 的客户端 token，注入的 github 对象即带 PAT 权限
           github-token: ${{ secrets.CLEANUP_TOKEN }}
+          # workflow_dispatch 的输入不会自动变成 INPUT_* 环境变量，必须显式传给脚本步骤，
+          # 否则 core.getInput('repos') 之类一律取到空字符串
+          repos: ${{ inputs.repos }}
+          keep_runs: ${{ inputs.keep_runs }}
+          run_max_age_days: ${{ inputs.run_max_age_days }}
+          artifact_max_age_hours: ${{ inputs.artifact_max_age_hours }}
+          dry_run: ${{ inputs.dry_run }}
           script: |
             const token = (process.env.CLEANUP_TOKEN || '').trim();
             if (!token) {
